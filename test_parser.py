@@ -1,12 +1,17 @@
 import sys
 import re
 import fitz
+from collections import defaultdict
 
 sys.path.insert(0, "C:/vent_app/project_root")
 
 RECT_RE = re.compile(r'(\d{2,4})\s*[xхХ×]\s*(\d{2,4})')
 ROUND_RE = re.compile(r'[ØøДд]\s*(\d{2,4})')
 THICK_RE = re.compile(r's=(\d+[.,]\d*)\s*мм', re.IGNORECASE)
+TRIPLE_RE = re.compile(r'(\d{2,4})\s*[xхХ×]\s*(\d{2,4})\s*[xхХ×]\s*(\d{2,4})')
+TRANSITION_RE = re.compile(
+    r'(\d{2,4})\s*[xхХ×]\s*(\d{2,4})\s*[-–]\s*(\d{2,4})\s*[xхХ×]\s*(\d{2,4})'
+)
 UNIT_RE = re.compile(r'^(м|шт\.?|компл\.?|кг)$', re.IGNORECASE)
 QTY_RE = re.compile(r'^\d+[.,]?\d*$')
 
@@ -19,12 +24,12 @@ GARBAGE = [
     "масса", "единицы", "позиция", "наименование", "техническая",
     "изм.", "кол.уч", "подп.", "взам.", "инв.", "подпись",
     "согласовано", "гр. вк", "гр. эл", "гр. ас", "мип-",
-    "с.1.494", "с.5.904", "теплоизоляция", "решетка", "клапан",
-    "лючок", "зонт", "вентилятор", "глушитель", "утепленная",
+    "с.1.494", "с.5.904", "теплоизоляция",
+    "решетка", "клапан", "зонт", "лючок",
+    "вентилятор", "глушитель", "утепленная",
     "наружные", "приточная", "вытяжная", "kern", "ursa",
     "санвент", "увк", "u=220", "м³", "система", "серия",
-    "крепление", "l=300", "рения", "чество", "лист",
-    "вентиляция", "санtventsservis", "сантвент",
+    "крепление", "рения", "чество", "вентиляция",
 ]
 
 
@@ -34,46 +39,87 @@ def is_duct_header(line):
 
 
 def is_garbage(line):
-    if re.match(r'^\d{1,2}$', line.strip()):
-        return True
-    if re.match(r'^[.\s]+$', line.strip()):
-        return True
-    if is_duct_header(line):
-        return False
+    if re.match(r'^\d{1,2}$', line.strip()): return True
+    if re.match(r'^[.\s]+$', line.strip()): return True
+    if is_duct_header(line): return False
     line_l = line.lower()
     return any(g in line_l for g in GARBAGE)
 
 
 def get_thickness_by_size(w=None, h=None, d=None):
-    if d: return 0.5 if d < 400 else 0.7
-    if w and h: return 0.5 if w < 400 and h < 400 else 0.7
-    return 0.5
+    sizes = [s for s in [w, h, d] if s is not None]
+    if not sizes: return 0.5
+    return 0.5 if max(sizes) < 400 else 0.7
 
 
 def calc_area(duct_type, w, h, d, qty, unit):
     if qty is None: return None
 
-    if "отвод" in duct_type or "переход" in duct_type:
-        if d:
-            perimeter = d / 1000 * 3.14
-        elif w and h:
-            perimeter = (w + h) / 1000 * 2
-        else:
-            return None
-        return round((perimeter * 1.10) * 0.6 * qty, 2)
-
     if "воздуховод" in duct_type or "труба" in duct_type:
-        if unit and unit.lower() not in ["м", "m"]:
-            return None
-        if d:
-            perimeter = d / 1000 * 3.14
-        elif w and h:
-            perimeter = (w + h) / 1000 * 2
-        else:
-            return None
+        if unit and unit.lower() not in ["м", "m"]: return None
+        if d: perimeter = d / 1000 * 3.14
+        elif w and h: perimeter = (w + h) / 1000 * 2
+        else: return None
         return round(perimeter * 1.10 * qty, 2)
 
+    if "отвод" in duct_type or "переход" in duct_type or "тройник" in duct_type:
+        if d: perimeter = d / 1000 * 3.14
+        elif w and h: perimeter = (w + h) / 1000 * 2
+        else: return None
+        return round((perimeter * 1.10) * 0.6 * qty, 2)
+
     return None
+
+
+def extract_sizes(full_text, duct_type):
+    """
+    Извлекает размеры в зависимости от типа элемента.
+    Возвращает (w, h, d) — уже с учётом логики выбора большего.
+    """
+    text_l = full_text.lower()
+
+    # --- Тройник: три числа (350х350х350) → берём два наибольших ---
+    if "тройник" in duct_type:
+        m = TRIPLE_RE.search(full_text)
+        if m:
+            nums = sorted([int(m.group(1)), int(m.group(2)), int(m.group(3))],
+                          reverse=True)
+            return nums[0], nums[1], None
+        # круглый тройник
+        rnd = ROUND_RE.search(full_text)
+        if rnd:
+            d = int(rnd.group(1))
+            return None, None, d
+
+    # --- Переход: два размера через дефис (150х200-300х300) → берём больший ---
+    if "переход" in duct_type:
+        m = TRANSITION_RE.search(full_text)
+        if m:
+            w1, h1 = int(m.group(1)), int(m.group(2))
+            w2, h2 = int(m.group(3)), int(m.group(4))
+            # берём тот у которого периметр больше
+            if (w1 + h1) >= (w2 + h2):
+                return w1, h1, None
+            else:
+                return w2, h2, None
+        # круглый переход: Д200/Д150 → берём больший
+        rounds = ROUND_RE.findall(full_text)
+        if len(rounds) >= 2:
+            d = max(int(rounds[0]), int(rounds[1]))
+            return None, None, d
+        if len(rounds) == 1:
+            return None, None, int(rounds[0])
+
+    # --- Воздуховод и отвод: один размер ---
+    rect = RECT_RE.search(full_text)
+    if rect:
+        return int(rect.group(1)), int(rect.group(2)), None
+
+    rnd = ROUND_RE.search(full_text)
+    if rnd:
+        return None, None, int(rnd.group(1))
+
+    return None, None, None
 
 
 def parse_pdf(path):
@@ -82,81 +128,68 @@ def parse_pdf(path):
     current_type = "воздуховод"
 
     for page_num, page in enumerate(doc, start=1):
-        blocks = page.get_text("blocks")
-        blocks = sorted(blocks, key=lambda b: (round(b[1] / 5), b[0]))
+        words = page.get_text("words")
 
-        # разбиваем строки по колонкам на основе X координат
-        # x < 1500  → название/размер
-        # x >= 1700 → единица
-        # x >= 1900 → количество
-        rows = []
-        for block in blocks:
-            x0, y0, text = block[0], block[1], block[4]
-            for line in text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                rows.append({"text": line, "x": x0, "y": y0})
+        name_rows = []
+        unit_rows = []
+        qty_rows = []
 
-        # группируем по Y — строки с одинаковым Y это одна строка таблицы
-        from collections import defaultdict
+        for wrd in words:
+            x0, y0, text = wrd[0], wrd[1], wrd[4].strip()
+            if not text: continue
+            y_key = round(y0)
+
+            if x0 >= 1900:
+                if QTY_RE.match(text):
+                    qty_rows.append({"text": text, "y": y_key})
+            elif x0 >= 1700:
+                if UNIT_RE.match(text):
+                    unit_rows.append({"text": text, "y": y_key})
+            else:
+                if not is_garbage(text):
+                    name_rows.append({"text": text, "y": y_key, "x": x0})
+
         y_groups = defaultdict(list)
-        for row in rows:
-            y_key = round(row["y"] / 5) * 5
-            y_groups[y_key].append(row)
+        for r in name_rows:
+            y_key = round(r["y"] / 8) * 8
+            y_groups[y_key].append(r)
 
         for y_key in sorted(y_groups.keys()):
-            group = y_groups[y_key]
+            group = sorted(y_groups[y_key], key=lambda r: r["x"])
+            full_text = " ".join(r["text"] for r in group)
 
-            name_parts = []
-            unit = None
-            qty = None
-
-            for item in group:
-                t = item["text"]
-                x = item["x"]
-
-                if x >= 1900:
-                    # колонка количества
-                    if QTY_RE.match(t.strip()):
-                        qty = float(t.replace(",", "."))
-                elif x >= 1700:
-                    # колонка единицы
-                    if UNIT_RE.match(t.strip()):
-                        unit = t.strip()
-                elif x < 1500:
-                    # колонка названия/размера
-                    if not is_garbage(t):
-                        name_parts.append(t)
-
-            if not name_parts:
-                continue
-
-            full_text = " ".join(name_parts)
-
-            # обновляем тип элемента
             if is_duct_header(full_text):
                 for kw in DUCT_KEYWORDS:
                     if kw in full_text.lower():
                         current_type = kw
                         break
+                continue  # ← заголовок не парсим как позицию
 
-            # ищем размер
-            rect = RECT_RE.search(full_text)
-            rnd = ROUND_RE.search(full_text)
-
-            if not rect and not rnd:
+            w, h, d = extract_sizes(full_text, current_type)
+            if w is None and h is None and d is None:
                 continue
-
-            w = h = d = None
-            if rect:
-                w, h = int(rect.group(1)), int(rect.group(2))
-            elif rnd:
-                d = int(rnd.group(1))
 
             thick_m = THICK_RE.search(full_text)
             thickness = (float(thick_m.group(1).replace(",", "."))
                          if thick_m else get_thickness_by_size(w, h, d))
+
+            # ближайшая единица по Y (допуск ±30px)
+            unit = None
+            best = 30
+            for ur in unit_rows:
+                dy = abs(ur["y"] - y_key)
+                if dy < best:
+                    best = dy
+                    unit = ur["text"]
+
+            # ближайшее количество по Y (допуск ±30px)
+            qty = None
+            best = 30
+            for qr in qty_rows:
+                dy = abs(qr["y"] - y_key)
+                if dy < best and QTY_RE.match(qr["text"]):
+                    best = dy
+                    qty = float(qr["text"].replace(",", "."))
 
             area = calc_area(current_type, w, h, d, qty, unit)
 
@@ -178,8 +211,7 @@ def parse_pdf(path):
 def summarize(items):
     summary = {}
     for item in items:
-        if item["area_m2"] is None:
-            continue
+        if item["area_m2"] is None: continue
         t = item["thickness"]
         summary[t] = round(summary.get(t, 0) + item["area_m2"], 2)
     return dict(sorted(summary.items()))
